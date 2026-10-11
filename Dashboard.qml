@@ -22,7 +22,7 @@ Item {
     }
     readonly property var gpu: latest.gpu || ({})
     readonly property bool sharedGpu: gpu.memory_kind === "shared"
-    function gpuName(n) { return (n || "").replace("NVIDIA GeForce ","").replace(/^Intel Corporation /,"") }
+    function gpuName(n) { return (n || "").replace("NVIDIA GeForce ","").replace(/^Intel (Corporation )?/,"") }
     function gpuExtra() {
         if (!gpu.available) return ""
         var temp = monitor.val(gpu.temperature,"°C")
@@ -176,7 +176,7 @@ Item {
         }
         Metric { title:"CPU"; subtitle:(latest.cores || []).length+" logical cores"; symbol:"\uf4bc"; series:"cpu"; value:latest.cpu; accent:monitor.cpuColor; extra:dash.cpuTemp >= 0 ? Math.round(dash.cpuTemp)+"°C" : "Temp unavailable" }
         Metric { title:"RAM"; subtitle:monitor.bytes((latest.memory || {}).used)+" / "+monitor.bytes((latest.memory || {}).total); symbol:"\uefc5"; series:"ram"; value:(latest.memory || {}).percent; accent:monitor.ramColor }
-        Metric { title:"GPU"; subtitle:dash.gpu.available ? dash.gpuName(dash.gpu.name)+" · "+(dash.sharedGpu ? "shared memory" : monitor.bytes(dash.gpu.total)) : "Telemetry unavailable"; symbol:"\uf108"; series:"gpu"; value:dash.gpu.percent; accent:monitor.gpuColor; extra:dash.gpuExtra() }
+        Metric { title:"GPU"; subtitle:dash.gpu.available ? dash.gpuName(dash.gpu.name)+" · "+(dash.sharedGpu ? "shared" : monitor.bytes(dash.gpu.total)) : "Telemetry unavailable"; symbol:"\uf108"; series:"gpu"; value:dash.gpu.percent; accent:monitor.gpuColor; extra:dash.gpuExtra() }
         Label { width:parent.width; elide:Text.ElideRight; text:(dash.sharedGpu ? "GPU memory (shared)  " : "VRAM  ")+monitor.bytes(dash.gpu.used)+" / "+monitor.bytes(dash.gpu.total)+"    |    "+dash.fanText(); color:dash.muted; font.pixelSize:Style.space(12) }
         Row {
             spacing:Style.space(4)
