@@ -45,7 +45,7 @@ def number(value):
     except ValueError:
         return None
 
-def gpu():
+def nvidia_gpu():
     if not os.access('/usr/bin/nvidia-smi', os.X_OK):
         return dict(available=False, error='GPU telemetry unavailable')
     try:
@@ -55,10 +55,194 @@ def gpu():
         cards = []
         for row in csv.reader(p.stdout.splitlines(), skipinitialspace=True):
             name, util, used, total, temp, power, fan = row
-            cards.append(dict(name=name, percent=number(util), used=None if number(used) is None else number(used)*1048576, total=None if number(total) is None else number(total)*1048576, temperature=number(temp), power=number(power), fan=number(fan)))
+            cards.append(dict(name=name, percent=number(util), used=None if number(used) is None else number(used)*1048576, total=None if number(total) is None else number(total)*1048576, temperature=number(temp), power=number(power), fan=number(fan), vendor='nvidia', memory_kind='dedicated'))
         return dict(available=bool(cards), cards=cards, **(cards[0] if cards else {}))
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return dict(available=False, error='NVIDIA telemetry unavailable')
+
+def gpu(intel=None, memory_total=None):
+    """NVIDIA through nvidia-smi when present, otherwise an Intel integrated GPU through sysfs and DRM fdinfo."""
+    card = nvidia_gpu()
+    if card['available'] or intel is None or not intel.available:
+        return card
+    return intel.sample(memory_total)
+
+SIZE_UNITS = {'B': 1, 'KiB': 1024, 'MiB': 1048576, 'GiB': 1073741824, 'TiB': 1099511627776}
+
+def size(text):
+    parts = text.split()
+    return int(parts[0]) * SIZE_UNITS.get(parts[1] if len(parts) > 1 else 'B', 1)
+
+def pci_name(vendor, device, database='/usr/share/hwdata/pci.ids'):
+    """Device name from the shared PCI ID database; None when missing."""
+    try:
+        lines = read(database).splitlines()
+    except OSError:
+        return None
+    inside = False
+    for line in lines:
+        if not line or line.startswith('#'):
+            continue
+        if not line.startswith('\t'):
+            inside = line[:4].lower() == vendor
+        elif inside and not line.startswith('\t\t') and line[1:5].lower() == device:
+            return line[5:].strip()
+    return None
+
+class IntelGpu:
+    """Read-only i915/xe telemetry without root: frequency and RC6 residency from sysfs, engine busy time and resident memory from the DRM fdinfo of readable processes."""
+    FREQ = (('gt/gt0/rps_act_freq_mhz', 'gt/gt0/rps_RP0_freq_mhz', 'gt/gt0/rc6_residency_ms'),
+            ('device/tile0/gt0/freq0/act_freq', 'device/tile0/gt0/freq0/rp0_freq', 'device/tile0/gt0/gtidle/idle_residency_ms'),
+            ('gt_act_freq_mhz', 'gt_RP0_freq_mhz', None))
+
+    def __init__(self, drm='/sys/class/drm', proc=PROC, hwmon='/sys/class/hwmon', database='/usr/share/hwdata/pci.ids'):
+        self.card = self.pdev = self.name = self.model = None
+        self.proc = Path(proc)
+        self.act = self.rp0 = self.rc6_path = None
+        self.clients, self.time, self.rc6 = {}, None, None
+        for card in sorted(Path(drm).glob('card[0-9]*')):
+            try:
+                if '-' in card.name or read(card/'device/vendor').strip().lower() != '0x8086':
+                    continue
+                device = read(card/'device/device').strip().lower().removeprefix('0x')
+            except OSError:
+                continue
+            self.card = card
+            link = card/'device'
+            self.pdev = os.path.basename(os.path.realpath(link)) if link.is_symlink() else None
+            self.model = pci_name('8086', device, database)
+            short = self.model.rsplit('[', 1)[1].rstrip(']') if self.model and '[' in self.model else None
+            self.name = 'Intel ' + short if short else (self.model or 'Intel GPU ' + device)
+            for act, rp0, rc6 in self.FREQ:
+                if (card/act).exists():
+                    self.act, self.rp0, self.rc6_path = card/act, card/rp0, (card/rc6 if rc6 else None)
+                    break
+            break
+        self.package = None
+        for label in glob.glob(hwmon + '/hwmon*/temp*_label'):
+            try:
+                if read(label).strip() == 'Package id 0':
+                    self.package = Path(label.replace('_label', '_input'))
+                    break
+            except OSError:
+                pass
+
+    @property
+    def available(self):
+        return self.card is not None
+
+    def scan(self):
+        """{client id: engines ns, memory bytes, capacity} for this card, from fdinfo this user may read."""
+        result = {}
+        for p in self.proc.iterdir():
+            if not p.name.isdigit():
+                continue
+            try:
+                fds = list((p/'fdinfo').iterdir())
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    text = read(fd)
+                except (OSError, ValueError):
+                    continue
+                if 'drm-driver:' not in text:
+                    continue
+                fields = {}
+                for line in text.splitlines():
+                    if line.startswith('drm-'):
+                        key, _, value = line.partition(':')
+                        fields[key] = value.strip()
+                pdev = fields.get('drm-pdev')
+                if (self.pdev and pdev and pdev != self.pdev) or fields.get('drm-driver') not in ('i915', 'xe'):
+                    continue
+                cid = fields.get('drm-client-id')
+                if not cid:
+                    continue
+                engines, capacity, memory = {}, {}, 0
+                try:
+                    for key, value in fields.items():
+                        if key.startswith('drm-engine-capacity-'):
+                            capacity[key[20:]] = int(value)
+                        elif key.startswith('drm-engine-'):
+                            engines[key[11:]] = int(value.split()[0])
+                        elif key.startswith('drm-resident-'):
+                            memory += size(value)
+                except (ValueError, IndexError):
+                    continue
+                result[cid] = dict(engines=engines, capacity=capacity, memory=memory)
+        return result
+
+    def read_int(self, path):
+        try:
+            return int(read(path).strip()) if path else None
+        except (OSError, ValueError):
+            return None
+
+    def sample(self, memory_total=None):
+        now = time.monotonic()
+        clients = self.scan()
+        elapsed = now - self.time if self.time else None
+        busy, capacity = {}, {}
+        for cid, c in clients.items():
+            old = self.clients.get(cid)
+            for engine, ns in c['engines'].items():
+                capacity[engine] = max(capacity.get(engine, 1), c['capacity'].get(engine, 1))
+                if old and engine in old['engines']:
+                    busy[engine] = busy.get(engine, 0) + max(0, ns - old['engines'][engine])
+        engines = {}
+        if elapsed and elapsed > 0:
+            engines = {e: round(min(100, busy[e] / (elapsed * 1e9) / capacity[e] * 100), 1) for e in sorted(busy)}
+        rc6 = self.read_int(self.rc6_path)
+        awake = None
+        if rc6 is not None and self.rc6 is not None and elapsed and elapsed > 0:
+            awake = round(max(0, min(100, 100 - (rc6 - self.rc6) / (elapsed * 1000) * 100)), 1)
+        temperature = self.read_int(self.package)
+        self.clients, self.time, self.rc6 = clients, now, rc6
+        card = dict(name=self.name, model=self.model, vendor='intel', percent=max(engines.values()) if engines else None,
+                    used=sum(c['memory'] for c in clients.values()), total=memory_total, memory_kind='shared',
+                    temperature=None if temperature is None else temperature / 1000, temperature_source='CPU package' if temperature is not None else None,
+                    power=None, fan=None, frequency=self.read_int(self.act), max_frequency=self.read_int(self.rp0),
+                    engines=engines, awake=awake, clients=len(clients))
+        return dict(available=True, cards=[card], **card)
+
+def fans(hwmon='/sys/class/hwmon'):
+    """System fans from hwmon: RPM, PWM duty when exposed. Two chips reporting one fan (dell_ddv beside dell_smm) merge: the label from one, the PWM from the other."""
+    result = []
+    for hw in sorted(glob.glob(hwmon + '/hwmon*')):
+        try:
+            chip = read(Path(hw)/'name').strip()
+        except OSError:
+            continue
+        for path in sorted(glob.glob(hw + '/fan*_input')):
+            index = Path(path).name[3:-6]
+            try:
+                rpm = int(read(path))
+            except (OSError, ValueError):
+                continue
+            label, pwm = Path(path.replace('_input', '_label')), Path(hw)/('pwm' + index)
+            try:
+                name = read(label).strip()
+                labeled = True
+            except OSError:
+                name, labeled = chip + ' fan' + index, False
+            percent = None
+            try:
+                percent = round(int(read(pwm)) / 255 * 100)
+            except (OSError, ValueError):
+                pass
+            result.append(dict(name=name, rpm=rpm, percent=percent, chip=chip, labeled=labeled))
+    merged = []
+    for f in result:
+        twin = next((m for m in merged if m['rpm'] == f['rpm'] and m['chip'] != f['chip'] and not (m['labeled'] and f['labeled'])), None)
+        if twin is None:
+            merged.append(dict(f))
+            continue
+        if f['labeled'] and not twin['labeled']:
+            twin.update(name=f['name'], chip=f['chip'], labeled=True)
+        if twin['percent'] is None:
+            twin['percent'] = f['percent']
+    return [dict((k, v) for k, v in f.items() if k != 'labeled') for f in merged]
 
 def network():
     result = {}
@@ -202,17 +386,18 @@ class Sampler:
         self.processes = {}
         self.process_time = None
         self.history = []
+        self.intel = IntelGpu()
 
     def sample(self, detailed=False):
         now = time.monotonic()
         elapsed = max(.001, now-self.time)
         cp = cpu_counters()
         mem = memory()
-        card = gpu()
+        card = gpu(self.intel, mem['total'])
         net, disk = network(), disks()
         cpu = cpu_percent(self.cpu['cpu'], cp['cpu'])
         self.history = (self.history + [dict(cpu=cpu, ram=mem['percent'], gpu=card.get('percent'))])[-60:]
-        result = dict(timestamp=time.time(), cpu=cpu, cores=[cpu_percent(self.cpu.get(k, v), v) for k, v in cp.items() if k != 'cpu'], memory=mem, gpu=card, network=rates(self.net, net, elapsed), disks=rates(self.disk, disk, elapsed), history=self.history, detailed=detailed, interval=2)
+        result = dict(timestamp=time.time(), cpu=cpu, cores=[cpu_percent(self.cpu.get(k, v), v) for k, v in cp.items() if k != 'cpu'], memory=mem, gpu=card, fans=fans(), network=rates(self.net, net, elapsed), disks=rates(self.disk, disk, elapsed), history=self.history, detailed=detailed, interval=2)
         if detailed:
             records = process_records()
             result.update(apps=group_processes(records, self.processes, max(.001, now-(self.process_time or now)), len(cp)-1), processes_warming=self.process_time is None, sensors=sensors(), mounts=mounts(), load=list(os.getloadavg()), uptime=float(read(PROC/'uptime').split()[0]))

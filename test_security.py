@@ -44,6 +44,7 @@ class SecurityTests(unittest.TestCase):
         for failure in failures:
             with self.subTest(failure=type(failure).__name__), patch.object(backend.os, 'access', return_value=True), patch.object(backend.subprocess, 'run', side_effect=failure):
                 self.assertEqual(backend.gpu(), {'available': False, 'error': 'NVIDIA telemetry unavailable'})
+                self.assertEqual(backend.nvidia_gpu(), {'available': False, 'error': 'NVIDIA telemetry unavailable'})
         with patch.object(backend.os, 'access', return_value=True), patch.object(backend.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='malformed, private data')):
             self.assertEqual(backend.gpu(), {'available': False, 'error': 'NVIDIA telemetry unavailable'})
 
@@ -63,6 +64,30 @@ class SecurityTests(unittest.TestCase):
         panel = (ROOT / 'Panel.qml').read_text()
         for field in ['moduleName', 'ipcTarget', 'target']:
             self.assertIn(field + ': "cynricantao.system-monitor"', panel)
+
+    def test_intel_collector_reads_only_sysfs_proc_and_pci_database(self):
+        import backend
+        import inspect
+        source = inspect.getsource(backend.IntelGpu) + inspect.getsource(backend.fans) + inspect.getsource(backend.pci_name)
+        self.assertNotIn('subprocess', source, msg='Intel and fan telemetry must not spawn processes')
+        self.assertNotIn('write_text', source)
+        for path in ['/sys/class/drm', '/sys/class/hwmon', '/usr/share/hwdata/pci.ids']:
+            self.assertIn(path, inspect.getsource(backend))
+
+    def test_intel_card_emits_no_paths_or_pids(self):
+        import backend
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            card = root/'drm'/'card0'; (card/'device').mkdir(parents=True)
+            (card/'device'/'vendor').write_text('0x8086'); (card/'device'/'device').write_text('0x46a8')
+            fd = root/'proc'/'4242'/'fdinfo'; fd.mkdir(parents=True)
+            (fd/'3').write_text('drm-driver:\ti915\ndrm-client-id:\t1\ndrm-engine-render:\t0 ns\ndrm-resident-system0:\t4 KiB\n')
+            gpu = backend.IntelGpu(drm=root/'drm', proc=root/'proc', hwmon=tmp, database=root/'none')
+            text = str(gpu.sample(1))
+            self.assertNotIn('4242', text)
+            self.assertNotIn(tmp, text)
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,4 +1,7 @@
+import os
+import tempfile
 import unittest
+from pathlib import Path
 import backend as b
 
 class Tests(unittest.TestCase):
@@ -63,6 +66,123 @@ class Tests(unittest.TestCase):
         self.assertFalse(result['detailed'])
         self.assertNotIn('apps',result)
         self.assertTrue(0 <= result['memory']['percent'] <= 100)
+
+    def fake_tree(self, root):
+        root = Path(root)
+        card = root/'drm'/'card1'
+        (card/'device').mkdir(parents=True)
+        (card/'device'/'vendor').write_text('0x8086\n')
+        (card/'device'/'device').write_text('0x46a8\n')
+        (card/'gt'/'gt0').mkdir(parents=True)
+        (card/'gt'/'gt0'/'rps_act_freq_mhz').write_text('850\n')
+        (card/'gt'/'gt0'/'rps_RP0_freq_mhz').write_text('1200\n')
+        (card/'gt'/'gt0'/'rc6_residency_ms').write_text('10000\n')
+        (root/'drm'/'card1-eDP-1').mkdir()
+        (root/'drm'/'renderD128').mkdir()
+        hw = root/'hwmon'
+        (hw/'hwmon5').mkdir(parents=True)
+        (hw/'hwmon5'/'name').write_text('coretemp\n')
+        (hw/'hwmon5'/'temp1_label').write_text('Package id 0\n')
+        (hw/'hwmon5'/'temp1_input').write_text('49000\n')
+        (hw/'hwmon3').mkdir()
+        (hw/'hwmon3'/'name').write_text('dell_ddv\n')
+        (hw/'hwmon3'/'fan1_input').write_text('1306\n')
+        (hw/'hwmon3'/'fan1_label').write_text('CPU Fan\n')
+        (hw/'hwmon4').mkdir()
+        (hw/'hwmon4'/'name').write_text('dell_smm\n')
+        (hw/'hwmon4'/'fan1_input').write_text('1306\n')
+        (hw/'hwmon4'/'pwm1').write_text('128\n')
+        (hw/'hwmon4'/'fan2_input').write_text('900\n')
+        (root/'pci.ids').write_text('# comment\n8086  Intel Corporation\n\t46a8  Alder Lake-UP3 GT2 [Iris Xe Graphics]\n\t\t1028 0b01  Subsystem\n10de  NVIDIA Corporation\n\t46a8  Not this one\n')
+        (root/'proc'/'1'/'fdinfo').mkdir(parents=True)
+        (root/'proc'/'self').mkdir()
+        return root
+
+    def fdinfo(self, root, pid, fd, cid, render, memory='100 KiB', driver='i915', pdev=None, video=None):
+        text = 'pos:\t0\nflags:\t02\ndrm-driver:\t%s\n' % driver + ('drm-pdev:\t%s\n' % pdev if pdev else '') + 'drm-client-id:\t%s\ndrm-engine-render:\t%d ns\ndrm-engine-copy:\t0 ns\ndrm-resident-system0:\t%s\ndrm-total-system0:\t%s\n' % (cid, render, memory, memory)
+        if video is not None:
+            text += 'drm-engine-capacity-video:\t2\ndrm-engine-video:\t%d ns\n' % video
+        d = root/'proc'/str(pid)/'fdinfo'
+        d.mkdir(parents=True, exist_ok=True)
+        (d/str(fd)).write_text(text)
+
+    def test_pci_name_matches_vendor_and_device_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.fake_tree(tmp)
+            self.assertEqual(b.pci_name('8086', '46a8', root/'pci.ids'), 'Alder Lake-UP3 GT2 [Iris Xe Graphics]')
+            self.assertIsNone(b.pci_name('8086', 'ffff', root/'pci.ids'))
+            self.assertIsNone(b.pci_name('8086', '46a8', root/'missing'))
+
+    def test_intel_gpu_engines_memory_and_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.fake_tree(tmp)
+            self.fdinfo(root, 1, 3, '5', render=0, memory='100 KiB')
+            self.fdinfo(root, 1, 4, '5', render=0, memory='100 KiB')  # same client, second fd: counted once
+            self.fdinfo(root, 2, 3, '6', render=0, memory='1 MiB', video=0)
+            self.fdinfo(root, 3, 3, '9', render=0, driver='amdgpu')  # other card
+            gpu = b.IntelGpu(drm=root/'drm', proc=root/'proc', hwmon=str(root/'hwmon'), database=root/'pci.ids')
+            self.assertTrue(gpu.available)
+            self.assertEqual(gpu.name, 'Intel Iris Xe Graphics')
+            first = gpu.sample(16 * 1024**3)
+            self.assertTrue(first['available'])
+            self.assertIsNone(first['percent'], msg='no delta on the first sample')
+            self.assertEqual(first['used'], 100*1024 + 1024**2)
+            self.assertEqual(first['total'], 16 * 1024**3)
+            self.assertEqual(first['memory_kind'], 'shared')
+            self.assertEqual(first['temperature'], 49.0)
+            self.assertEqual((first['frequency'], first['max_frequency']), (850, 1200))
+            self.assertIsNone(first['power'])
+            self.assertIsNone(first['fan'])
+            gpu.time -= 1.0  # one second passed
+            gpu.rc6 -= 700
+            self.fdinfo(root, 1, 3, '5', render=int(0.5e9), memory='100 KiB')
+            self.fdinfo(root, 1, 4, '5', render=int(0.5e9), memory='100 KiB')
+            self.fdinfo(root, 2, 3, '6', render=int(0.1e9), memory='1 MiB', video=int(1.0e9))  # capacity 2: 50%
+            second = gpu.sample(16 * 1024**3)
+            self.assertAlmostEqual(second['engines']['render'], 60, delta=1.5)
+            self.assertAlmostEqual(second['engines']['video'], 50, delta=1.5)
+            self.assertEqual(second['engines']['copy'], 0)
+            self.assertEqual(second['percent'], second['engines']['render'])
+            self.assertAlmostEqual(second['awake'], 30, delta=1.5)
+            self.assertEqual(second['clients'], 2)
+
+    def test_intel_gpu_unreadable_fdinfo_and_exited_clients_are_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.fake_tree(tmp)
+            self.fdinfo(root, 1, 3, '5', render=int(5e9))
+            gpu = b.IntelGpu(drm=root/'drm', proc=root/'proc', hwmon=str(root/'hwmon'), database=root/'pci.ids')
+            gpu.sample(1)
+            gpu.time -= 1.0
+            (root/'proc'/'1'/'fdinfo'/'3').unlink()  # exited
+            self.fdinfo(root, 7, 3, '8', render=int(9e9))  # new client: no baseline, no spike
+            os.chmod(root/'proc'/'7'/'fdinfo'/'3', 0)
+            try:
+                result = gpu.sample(1)
+            finally:
+                os.chmod(root/'proc'/'7'/'fdinfo'/'3', 0o644)
+            self.assertEqual(result['engines'], {})
+            self.assertIsNone(result['percent'])
+
+    def test_no_intel_card_is_unavailable_without_scanning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp)/'drm').mkdir()
+            gpu = b.IntelGpu(drm=Path(tmp)/'drm', proc=Path(tmp), hwmon=tmp, database=Path(tmp)/'none')
+            self.assertFalse(gpu.available)
+            from unittest.mock import patch
+            with patch.object(b.os, 'access', return_value=False):
+                self.assertEqual(b.gpu(gpu, 1), {'available': False, 'error': 'GPU telemetry unavailable'})
+
+    def test_fans_merge_mirrored_chips_keeping_label_and_pwm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.fake_tree(tmp)
+            result = b.fans(str(root/'hwmon'))
+            self.assertEqual(result, [dict(name='CPU Fan', rpm=1306, percent=50, chip='dell_ddv'), dict(name='dell_smm fan2', rpm=900, percent=None, chip='dell_smm')])
+
+    def test_sample_carries_fans_and_gpu_history(self):
+        sampler = b.Sampler()
+        result = sampler.sample(False)
+        self.assertIsInstance(result['fans'], list)
+        self.assertIn('gpu', result['history'][-1])
 
 if __name__=='__main__':
     unittest.main()

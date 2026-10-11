@@ -20,6 +20,34 @@ Item {
         var list = (detail.sensors || []).filter(function(s){return /Package|Core/.test(s.name)})
         return list.length ? Math.max.apply(null,list.map(function(s){return s.temperature})) : -1
     }
+    readonly property var gpu: latest.gpu || ({})
+    readonly property bool sharedGpu: gpu.memory_kind === "shared"
+    function gpuName(n) { return (n || "").replace("NVIDIA GeForce ","").replace(/^Intel Corporation /,"") }
+    function gpuExtra() {
+        if (!gpu.available) return ""
+        var temp = monitor.val(gpu.temperature,"°C")
+        if (gpu.power !== null && gpu.power !== undefined) return temp+" · "+monitor.val(gpu.power,"W")
+        if (gpu.frequency !== null && gpu.frequency !== undefined) return temp+" · "+Math.round(gpu.frequency)+" MHz"
+        return temp
+    }
+    function fanText() {
+        if (gpu.fan !== null && gpu.fan !== undefined) return "GPU fan "+monitor.val(gpu.fan,"%")
+        var list = latest.fans || []
+        if (!list.length) return "Fan Unavailable"
+        var f = list[0]
+        return f.name+" "+f.rpm+" RPM"+(f.percent !== null && f.percent !== undefined ? " · "+f.percent+"%" : "")
+    }
+    function engineText() {
+        var e = gpu.engines || {}
+        var keys = Object.keys(e)
+        if (!keys.length) return ""
+        var names = {render:"Render", copy:"Copy", video:"Video", "video-enhance":"Enhance", compute:"Compute"}
+        var parts = keys.map(function(k){ return (names[k] || k)+" "+Math.round(e[k])+"%" })
+        if (gpu.awake !== null && gpu.awake !== undefined) parts.push("Awake "+Math.round(gpu.awake)+"%")
+        if (gpu.frequency !== null && gpu.frequency !== undefined) parts.push(Math.round(gpu.frequency)+" / "+Math.round(gpu.max_frequency || 0)+" MHz")
+        parts.push(gpu.clients+" DRM clients")
+        return "GPU engines · "+parts.join(" · ")
+    }
     implicitHeight: body.implicitHeight
     onLatestChanged: {
         if (!monitor.opened) return
@@ -148,8 +176,8 @@ Item {
         }
         Metric { title:"CPU"; subtitle:(latest.cores || []).length+" logical cores"; symbol:"\uf4bc"; series:"cpu"; value:latest.cpu; accent:monitor.cpuColor; extra:dash.cpuTemp >= 0 ? Math.round(dash.cpuTemp)+"°C" : "Temp unavailable" }
         Metric { title:"RAM"; subtitle:monitor.bytes((latest.memory || {}).used)+" / "+monitor.bytes((latest.memory || {}).total); symbol:"\uefc5"; series:"ram"; value:(latest.memory || {}).percent; accent:monitor.ramColor }
-        Metric { title:"GPU"; subtitle:(latest.gpu || {}).available ? latest.gpu.name.replace("NVIDIA GeForce ","")+" · "+monitor.bytes(latest.gpu.total) : "Telemetry unavailable"; symbol:"\uf108"; series:"gpu"; value:(latest.gpu || {}).percent; accent:monitor.gpuColor; extra:(latest.gpu || {}).available ? monitor.val(latest.gpu.temperature,"°C")+" · "+monitor.val(latest.gpu.power,"W") : "" }
-        Label { width:parent.width; text:"VRAM  "+monitor.bytes((latest.gpu || {}).used)+" / "+monitor.bytes((latest.gpu || {}).total)+"    |    Fan "+monitor.val((latest.gpu || {}).fan,"%"); color:dash.muted; font.pixelSize:Style.space(12) }
+        Metric { title:"GPU"; subtitle:dash.gpu.available ? dash.gpuName(dash.gpu.name)+" · "+(dash.sharedGpu ? "shared memory" : monitor.bytes(dash.gpu.total)) : "Telemetry unavailable"; symbol:"\uf108"; series:"gpu"; value:dash.gpu.percent; accent:monitor.gpuColor; extra:dash.gpuExtra() }
+        Label { width:parent.width; elide:Text.ElideRight; text:(dash.sharedGpu ? "GPU memory (shared)  " : "VRAM  ")+monitor.bytes(dash.gpu.used)+" / "+monitor.bytes(dash.gpu.total)+"    |    "+dash.fanText(); color:dash.muted; font.pixelSize:Style.space(12) }
         Row {
             spacing:Style.space(4)
             Action { text:"Processes"; selected:dash.page==="processes"; onClicked:dash.page="processes" }
@@ -193,7 +221,16 @@ Item {
                     Label { anchors.right:parent.right; anchors.rightMargin:Style.space(10); anchors.verticalCenter:parent.verticalCenter; text:Math.round(modelData.temperature)+"°C"; color:modelData.temperature>=80 ? monitor.warmColor : monitor.cpuColor }
                 }
             }
-            Label { visible:!(detail.sensors || []).length; text:"Sensors unavailable"; color:dash.muted }
+            Repeater {
+                model:latest.fans || []
+                delegate:Rectangle {
+                    required property var modelData
+                    width:(body.width-Style.space(7))/2; height:Style.space(28); radius: 0; color:"#202430"
+                    Label { x:Style.space(10); anchors.verticalCenter:parent.verticalCenter; text:modelData.name; color:dash.muted; width:parent.width-Style.space(120); elide:Text.ElideRight }
+                    Label { anchors.right:parent.right; anchors.rightMargin:Style.space(10); anchors.verticalCenter:parent.verticalCenter; text:modelData.rpm+" RPM"+(modelData.percent !== null && modelData.percent !== undefined ? " · "+modelData.percent+"%" : ""); color:monitor.gpuColor }
+                }
+            }
+            Label { visible:!(detail.sensors || []).length && !(latest.fans || []).length; text:"Sensors unavailable"; color:dash.muted }
         }
         Column { width:parent.width; spacing:Style.space(8); visible:dash.page === "storage"
         Rule {}
@@ -245,9 +282,10 @@ Item {
             Flow { width:parent.width; spacing:Style.space(6)
                 Repeater { model:latest.cores || []; delegate:Rectangle { required property var modelData; required property int index; width:Style.space(67); height:Style.space(24); radius: 0; color:"#252a37"; Label { anchors.centerIn:parent; text:index+" · "+monitor.pct(modelData); color:monitor.cpuColor; font.pixelSize:Style.space(11) } } }
             }
+            Label { visible:text !== ""; width:parent.width; wrapMode:Text.Wrap; color:dash.muted; font.pixelSize:Style.space(11); text:dash.engineText() }
             Repeater { model:latest.disks || []; delegate:Label { required property var modelData; text:modelData.name+" · Read "+monitor.bytes(modelData.read)+"/s · Write "+monitor.bytes(modelData.write)+"/s"; color:dash.muted; font.pixelSize:Style.space(11) } }
             Repeater { model:detail.mounts || []; delegate:Label { required property var modelData; width:parent.width; elide:Text.ElideMiddle; text:modelData.name+" · Available "+monitor.bytes(modelData.available); color:dash.muted; font.pixelSize:Style.space(11) } }
-            Label { width:parent.width; wrapMode:Text.Wrap; text:"Load "+(detail.load || []).map(function(n){return n.toFixed(2)}).join(" / ")+" · Uptime "+Math.floor((detail.uptime || 0)/3600)+"h\nRSS matches btop process accounting; shared pages count in each process. PSS apportions shared pages and is Unavailable if any nonzero-RSS process denies access. Network interfaces may overlap tunnel traffic. Sparklines: ≈2 minutes; resource scale 0–100%, network scale per-interface peak."; color:dash.muted; opacity:0.65; font.pixelSize:Style.space(10) }
+            Label { width:parent.width; wrapMode:Text.Wrap; text:"Load "+(detail.load || []).map(function(n){return n.toFixed(2)}).join(" / ")+" · Uptime "+Math.floor((detail.uptime || 0)/3600)+"h\nRSS matches btop process accounting; shared pages count in each process. PSS apportions shared pages and is Unavailable if any nonzero-RSS process denies access. Network interfaces may overlap tunnel traffic. Sparklines: ≈2 minutes; resource scale 0–100%, network scale per-interface peak."+(dash.sharedGpu ? "\nIntegrated GPU: busy % is the busiest engine across DRM clients this user can read; memory is shared system RAM resident to GPU clients; temperature is the CPU package sensor." : ""); color:dash.muted; opacity:0.65; font.pixelSize:Style.space(10) }
         }
     }
 }

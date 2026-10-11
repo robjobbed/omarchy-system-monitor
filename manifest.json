@@ -2,12 +2,16 @@
   "schemaVersion": 1,
   "id": "cynricantao.system-monitor",
   "name": "System Monitor",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "cynricantao",
   "license": "MIT",
-  "description": "Lightweight CPU, RAM and NVIDIA GPU dashboard with application-grouped processes.",
-  "kinds": ["bar-widget"],
-  "entryPoints": {"barWidget": "Panel.qml"},
+  "description": "Lightweight CPU, RAM and GPU (NVIDIA or Intel integrated) dashboard with system fans and application-grouped processes.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
   "barWidget": {
     "displayName": "System Monitor",
     "category": "System",

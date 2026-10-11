@@ -1,8 +1,8 @@
 # System Monitor
 
-Read-only Omarchy/Quickshell bar widget for CPU, RAM, NVIDIA GPU, grouped applications, temperatures, storage and network rates.
+Read-only Omarchy/Quickshell bar widget for CPU, RAM, GPU (NVIDIA, or Intel integrated graphics), system fans, grouped applications, temperatures, storage and network rates.
 
-Plugin ID: `cynricantao.system-monitor`. Requires Omarchy's native `qs.Ui`/`qs.Commons` APIs and `/usr/bin/python3` (standard library only). NVIDIA metrics optionally use `/usr/bin/nvidia-smi`; missing or unsupported telemetry is shown as unavailable. No root privileges, separate service or Python packages are needed. GPU adapters for AMD/Intel and per-application GPU usage are not implemented.
+Plugin ID: `cynricantao.system-monitor`. Requires Omarchy's native `qs.Ui`/`qs.Commons` APIs and `/usr/bin/python3` (standard library only). NVIDIA metrics optionally use `/usr/bin/nvidia-smi`. Intel integrated GPUs (i915 or xe driver) are read from sysfs and DRM fdinfo without any extra tool; see [Intel GPUs](#intel-gpus). Missing or unsupported telemetry is shown as unavailable. No root privileges, separate service or Python packages are needed. AMD adapters and per-application GPU usage are not implemented.
 
 ## Screenshots
 
@@ -57,10 +57,25 @@ Click a RAM/CPU/GPU bar icon or percentage to toggle the popup; Escape or an out
 - Application CPU: summed user/system tick deltas normalized by logical core count. Opening requires two samples; PID reuse is detected and exited processes are not retained.
 - RSS: summed resident pages from `/proc/PID/stat`. Shared pages count in each process, so group totals can exceed attributable physical memory. PSS: summed readable `smaps_rollup` proportional memory; a missing PSS for any nonzero-RSS process makes that group's PSS unavailable, never a mixture of RSS and PSS. Application totals need not equal system-used RAM.
 - Common browser/Steam helpers join their application group. Other executables group by basename; interpreter-based programs may share a Python/Node group. Kernel threads are grouped.
-- GPU: NVIDIA utilization, VRAM and sensor values, with unavailable values when unsupported.
+- GPU: NVIDIA utilization, VRAM and sensor values through `nvidia-smi`, with unavailable values when unsupported. Without `nvidia-smi`, the first Intel DRM card is used instead (below).
+- Fans: every hwmon `fan*_input`, with the hwmon label when there is one and the PWM duty as a percentage when `pwm<N>` is readable. Two chips reporting one fan at the same RPM (Dell's `dell_ddv` beside `dell_smm`) merge into one entry carrying the label from one and the PWM from the other. The first fan is shown under the GPU card; all of them in Temps.
 - Network: per-interface receive/transmit counter deltas; tunnels can overlap physical traffic. Disk rates use whole block devices, not partitions. Storage deduplicates same-source/same-capacity mounts.
 - One Python collector samples every two seconds **after collection**. Process and smaps scans occur only while the popup is open. CPU/RAM/GPU history keeps 60 samples; per-interface network history keeps 60 points updated only while open. Histories are in memory. Detail cost depends on process count and memory maps; no performance guarantees or published benchmark claims are made.
 - Bar metrics become stale after eight seconds without a successful sample. Collector restart attempts occur every ten seconds after failure. Animations are finite.
+
+## Intel GPUs
+
+Integrated Intel graphics has no `nvidia-smi` equivalent, and `intel_gpu_top` needs perf privileges, so the collector reads what the kernel exposes to an ordinary user:
+
+- **Busy %** is the busiest engine (render, copy, video, video-enhance) over the sample interval, summed across the DRM clients whose `/proc/PID/fdinfo` this user can read, normalized by engine capacity. Other users' GPU work is invisible, so a system with another active seat under-reports. The first sample has no delta and shows `—`.
+- **Awake %** (Details) is the share of the interval the GPU spent out of RC6 power saving, from `rc6_residency_ms`. It is system-wide and usually a little above the busy figure.
+- **Memory** is shared system RAM: the sum of `drm-resident-*` across clients, over total RAM. There is no VRAM on an integrated GPU.
+- **Frequency** is the current and RP0 (maximum) GT frequency from sysfs. An idle GPU reports 0 MHz.
+- **Temperature** is the CPU package sensor (`coretemp`, `Package id 0`): the GPU shares the die and has no sensor of its own. The Details note says so.
+- **Power** is unavailable: the RAPL `uncore` energy counter is root-only on current kernels.
+- The card name comes from `/usr/share/hwdata/pci.ids` (the bracketed marketing name, e.g. Iris Xe Graphics), with a fallback to the PCI device id.
+
+The fdinfo scan reads about a thousand small files and costs roughly 10–15 ms per two-second sample on a 12-thread laptop. Both i915 (`gt/gt0/`) and xe (`device/tile0/gt0/`) sysfs layouts are recognized; only i915 has been tested, on an Alder Lake Iris Xe.
 
 ## Local management and IPC
 
