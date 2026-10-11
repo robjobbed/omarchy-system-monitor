@@ -96,6 +96,7 @@ class Tests(unittest.TestCase):
         (root/'pci.ids').write_text('# comment\n8086  Intel Corporation\n\t46a8  Alder Lake-UP3 GT2 [Iris Xe Graphics]\n\t\t1028 0b01  Subsystem\n10de  NVIDIA Corporation\n\t46a8  Not this one\n')
         (root/'proc'/'1'/'fdinfo').mkdir(parents=True)
         (root/'proc'/'self').mkdir()
+        (root/'proc'/'1'/'fd').mkdir()
         return root
 
     def fdinfo(self, root, pid, fd, cid, render, memory='100 KiB', driver='i915', pdev=None, video=None):
@@ -105,6 +106,12 @@ class Tests(unittest.TestCase):
         d = root/'proc'/str(pid)/'fdinfo'
         d.mkdir(parents=True, exist_ok=True)
         (d/str(fd)).write_text(text)
+        links = root/'proc'/str(pid)/'fd'
+        links.mkdir(exist_ok=True)
+        if not (links/str(fd)).is_symlink():
+            os.symlink('/dev/dri/renderD128', links/str(fd))
+        if not (links/'0').is_symlink():
+            os.symlink('/dev/null', links/'0')  # ordinary fd: never opened
 
     def test_pci_name_matches_vendor_and_device_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -175,8 +182,12 @@ class Tests(unittest.TestCase):
     def test_fans_merge_mirrored_chips_keeping_label_and_pwm(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self.fake_tree(tmp)
-            result = b.fans(str(root/'hwmon'))
-            self.assertEqual(result, [dict(name='CPU Fan', rpm=1306, percent=50, chip='dell_ddv'), dict(name='dell_smm fan2', rpm=900, percent=None, chip='dell_smm')])
+            fans = b.Fans(str(root/'hwmon'))
+            self.assertEqual(fans.sample(), [dict(name='CPU Fan', rpm=1306, percent=50, chip='dell_ddv'), dict(name='dell_smm fan2', rpm=900, percent=None, chip='dell_smm')])
+            (root/'hwmon'/'hwmon4'/'fan1_input').write_text('1400\n')  # chips disagree: no longer a mirror
+            self.assertEqual([f['rpm'] for f in fans.sample()], [1306, 1400, 900])
+            (root/'hwmon'/'hwmon3'/'fan1_input').unlink()  # vanished sensor is skipped, not fatal
+            self.assertEqual([f['name'] for f in fans.sample()], ['dell_smm fan1', 'dell_smm fan2'])
 
     def test_sample_carries_fans_and_gpu_history(self):
         sampler = b.Sampler()

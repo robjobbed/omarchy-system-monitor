@@ -132,21 +132,26 @@ class IntelGpu:
         return self.card is not None
 
     def scan(self):
-        """{client id: engines ns, memory bytes, capacity} for this card, from fdinfo this user may read."""
+        """{client id: engines ns, memory bytes, capacity} for this card, from the fdinfo of DRM fds this user may read."""
         result = {}
-        for p in self.proc.iterdir():
-            if not p.name.isdigit():
+        for entry in os.scandir(self.proc):
+            if not entry.name.isdigit():
                 continue
+            fd_dir = os.path.join(entry.path, 'fd')
             try:
-                fds = list((p/'fdinfo').iterdir())
+                fds = os.listdir(fd_dir)
             except OSError:
                 continue
             for fd in fds:
                 try:
-                    text = read(fd)
+                    if not os.readlink(os.path.join(fd_dir, fd)).startswith('/dev/dri/'):
+                        continue
+                    handle = os.open(os.path.join(entry.path, 'fdinfo', fd), os.O_RDONLY)
+                    try:
+                        text = os.read(handle, 8192).decode()
+                    finally:
+                        os.close(handle)
                 except (OSError, ValueError):
-                    continue
-                if 'drm-driver:' not in text:
                     continue
                 fields = {}
                 for line in text.splitlines():
@@ -206,43 +211,54 @@ class IntelGpu:
                     engines=engines, awake=awake, clients=len(clients))
         return dict(available=True, cards=[card], **card)
 
-def fans(hwmon='/sys/class/hwmon'):
-    """System fans from hwmon: RPM, PWM duty when exposed. Two chips reporting one fan (dell_ddv beside dell_smm) merge: the label from one, the PWM from the other."""
-    result = []
-    for hw in sorted(glob.glob(hwmon + '/hwmon*')):
-        try:
-            chip = read(Path(hw)/'name').strip()
-        except OSError:
-            continue
-        for path in sorted(glob.glob(hw + '/fan*_input')):
-            index = Path(path).name[3:-6]
+class Fans:
+    """System fans from hwmon: RPM, PWM duty when exposed. Discovery globs sysfs once; sampling reads a few files. Two chips reporting one fan (dell_ddv beside dell_smm) merge: the label from one, the PWM from the other."""
+    def __init__(self, hwmon='/sys/class/hwmon'):
+        self.hwmon = hwmon
+        self.discover()
+
+    def discover(self):
+        self.entries = []
+        for hw in sorted(glob.glob(self.hwmon + '/hwmon*')):
             try:
-                rpm = int(read(path))
+                chip = read(Path(hw)/'name').strip()
+            except OSError:
+                continue
+            for path in sorted(glob.glob(hw + '/fan*_input')):
+                index = Path(path).name[3:-6]
+                label, pwm = Path(path.replace('_input', '_label')), Path(hw)/('pwm' + index)
+                try:
+                    name, labeled = read(label).strip(), True
+                except OSError:
+                    name, labeled = chip + ' fan' + index, False
+                self.entries.append(dict(input=path, pwm=pwm if pwm.exists() else None, name=name, chip=chip, labeled=labeled))
+
+    def sample(self):
+        merged = []
+        for e in self.entries:
+            try:
+                rpm = int(read(e['input']))
             except (OSError, ValueError):
                 continue
-            label, pwm = Path(path.replace('_input', '_label')), Path(hw)/('pwm' + index)
-            try:
-                name = read(label).strip()
-                labeled = True
-            except OSError:
-                name, labeled = chip + ' fan' + index, False
             percent = None
-            try:
-                percent = round(int(read(pwm)) / 255 * 100)
-            except (OSError, ValueError):
-                pass
-            result.append(dict(name=name, rpm=rpm, percent=percent, chip=chip, labeled=labeled))
-    merged = []
-    for f in result:
-        twin = next((m for m in merged if m['rpm'] == f['rpm'] and m['chip'] != f['chip'] and not (m['labeled'] and f['labeled'])), None)
-        if twin is None:
-            merged.append(dict(f))
-            continue
-        if f['labeled'] and not twin['labeled']:
-            twin.update(name=f['name'], chip=f['chip'], labeled=True)
-        if twin['percent'] is None:
-            twin['percent'] = f['percent']
-    return [dict((k, v) for k, v in f.items() if k != 'labeled') for f in merged]
+            if e['pwm']:
+                try:
+                    percent = round(int(read(e['pwm'])) / 255 * 100)
+                except (OSError, ValueError):
+                    pass
+            f = dict(name=e['name'], rpm=rpm, percent=percent, chip=e['chip'], labeled=e['labeled'])
+            twin = next((m for m in merged if m['rpm'] == f['rpm'] and m['chip'] != f['chip'] and not (m['labeled'] and f['labeled'])), None)
+            if twin is None:
+                merged.append(f)
+                continue
+            if f['labeled'] and not twin['labeled']:
+                twin.update(name=f['name'], chip=f['chip'], labeled=True)
+            if twin['percent'] is None:
+                twin['percent'] = f['percent']
+        return [dict((k, v) for k, v in f.items() if k != 'labeled') for f in merged]
+
+def fans(hwmon='/sys/class/hwmon'):
+    return Fans(hwmon).sample()
 
 def network():
     result = {}
@@ -387,6 +403,9 @@ class Sampler:
         self.process_time = None
         self.history = []
         self.intel = IntelGpu()
+        self.fans = Fans()
+        self.fan_data = []
+        self.count = 0
 
     def sample(self, detailed=False):
         now = time.monotonic()
@@ -394,10 +413,15 @@ class Sampler:
         cp = cpu_counters()
         mem = memory()
         card = gpu(self.intel, mem['total'])
+        self.count += 1
+        if self.count % 30 == 0:
+            self.fans.discover()  # hotplugged sensors, once a minute
+        if self.count % 3 == 1:
+            self.fan_data = self.fans.sample()  # every 6 s: firmware-backed hwmon reads (dell_smm) cost milliseconds each
         net, disk = network(), disks()
         cpu = cpu_percent(self.cpu['cpu'], cp['cpu'])
         self.history = (self.history + [dict(cpu=cpu, ram=mem['percent'], gpu=card.get('percent'))])[-60:]
-        result = dict(timestamp=time.time(), cpu=cpu, cores=[cpu_percent(self.cpu.get(k, v), v) for k, v in cp.items() if k != 'cpu'], memory=mem, gpu=card, fans=fans(), network=rates(self.net, net, elapsed), disks=rates(self.disk, disk, elapsed), history=self.history, detailed=detailed, interval=2)
+        result = dict(timestamp=time.time(), cpu=cpu, cores=[cpu_percent(self.cpu.get(k, v), v) for k, v in cp.items() if k != 'cpu'], memory=mem, gpu=card, fans=self.fan_data, network=rates(self.net, net, elapsed), disks=rates(self.disk, disk, elapsed), history=self.history, detailed=detailed, interval=2)
         if detailed:
             records = process_records()
             result.update(apps=group_processes(records, self.processes, max(.001, now-(self.process_time or now)), len(cp)-1), processes_warming=self.process_time is None, sensors=sensors(), mounts=mounts(), load=list(os.getloadavg()), uptime=float(read(PROC/'uptime').split()[0]))

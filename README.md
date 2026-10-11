@@ -58,7 +58,7 @@ Click a RAM/CPU/GPU bar icon or percentage to toggle the popup; Escape or an out
 - RSS: summed resident pages from `/proc/PID/stat`. Shared pages count in each process, so group totals can exceed attributable physical memory. PSS: summed readable `smaps_rollup` proportional memory; a missing PSS for any nonzero-RSS process makes that group's PSS unavailable, never a mixture of RSS and PSS. Application totals need not equal system-used RAM.
 - Common browser/Steam helpers join their application group. Other executables group by basename; interpreter-based programs may share a Python/Node group. Kernel threads are grouped.
 - GPU: NVIDIA utilization, VRAM and sensor values through `nvidia-smi`, with unavailable values when unsupported. Without `nvidia-smi`, the first Intel DRM card is used instead (below).
-- Fans: every hwmon `fan*_input`, with the hwmon label when there is one and the PWM duty as a percentage when `pwm<N>` is readable. Two chips reporting one fan at the same RPM (Dell's `dell_ddv` beside `dell_smm`) merge into one entry carrying the label from one and the PWM from the other. The first fan is shown under the GPU card; all of them in Temps.
+- Fans: every hwmon `fan*_input`, with the hwmon label when there is one and the PWM duty as a percentage when `pwm<N>` is readable. Two chips reporting one fan at the same RPM (Dell's `dell_ddv` beside `dell_smm`) merge into one entry carrying the label from one and the PWM from the other. Fans are re-read every third sample (6 s) because firmware-backed drivers such as `dell_smm` take milliseconds per read. The first fan is shown under the GPU card; all of them in Temps.
 - Network: per-interface receive/transmit counter deltas; tunnels can overlap physical traffic. Disk rates use whole block devices, not partitions. Storage deduplicates same-source/same-capacity mounts.
 - One Python collector samples every two seconds **after collection**. Process and smaps scans occur only while the popup is open. CPU/RAM/GPU history keeps 60 samples; per-interface network history keeps 60 points updated only while open. Histories are in memory. Detail cost depends on process count and memory maps; no performance guarantees or published benchmark claims are made.
 - Bar metrics become stale after eight seconds without a successful sample. Collector restart attempts occur every ten seconds after failure. Animations are finite.
@@ -75,7 +75,7 @@ Integrated Intel graphics has no `nvidia-smi` equivalent, and `intel_gpu_top` ne
 - **Power** is unavailable: the RAPL `uncore` energy counter is root-only on current kernels.
 - The card name comes from `/usr/share/hwdata/pci.ids` (the bracketed marketing name, e.g. Iris Xe Graphics), with a fallback to the PCI device id.
 
-The fdinfo scan reads about a thousand small files and costs roughly 10–15 ms per two-second sample on a 12-thread laptop. Both i915 (`gt/gt0/`) and xe (`device/tile0/gt0/`) sysfs layouts are recognized; only i915 has been tested, on an Alder Lake Iris Xe.
+The scan follows `/proc/PID/fd` links and reads only the fdinfo of DRM descriptors, about 3 ms per two-second sample on a 12-thread laptop with a dozen GPU clients. Both i915 (`gt/gt0/`) and xe (`device/tile0/gt0/`) sysfs layouts are recognized; only i915 has been tested, on an Alder Lake Iris Xe.
 
 ## Local management and IPC
 
